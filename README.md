@@ -48,13 +48,16 @@ Standard 4-bit block quantization (`Q4_0`) packs two 4-bit weights into each byt
 | Quantization Format | Size (`MB`) | RAM Compression | RMSE Error | Max Abs Error | SQNR (`dB`) | Layer Output Drift |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **1. `Q8_0` (8-bit Symmetric Block)** | `0.28 MB` | `3.56x` | `2.0145e-4` | `2.8912e-3` | `41.64 dB` | — |
-| **2. `Q4_0` (4-bit Canonical Basis)** | `0.16 MB` | `6.40x` | `3.5120e-3` | `4.9320e-2` | `16.81 dB` | `1.8740e-2` |
-| **3. `Q4_Hadamard` (4-bit Orthonormal Basis $H_{32}$)** | **`0.16 MB`** | **`6.40x`** | **`2.1220e-3`** | **`3.3063e-2`** | **`21.18 dB`** | **`1.6909e-2`** |
-| **4. `Q4_Stats` (4-bit Outlier-Aware OLS)** | **`0.17 MB`** | **`5.73x`** | **`1.6692e-3`** | **`9.6453e-3`** | **`23.27 dB`** | **`8.8033e-3`** |
+| **2. `Q4_0` (4-bit Canonical Basis)** | `0.16 MB` | `6.40x` | `3.5120e-3` | `4.9320e-2` | `16.81 dB` | `1.8740e-2` (`1.00x`) |
+| **3. `Q4_Hadamard` (4-bit Orthonormal Basis $H_{32}$)** | **`0.16 MB`** | **`6.40x`** | **`2.1220e-3`** | **`3.3063e-2`** | **`21.18 dB`** | **`1.6909e-2` (`1.11x`)** |
+| **4. `Q4_Stats` (4-bit Outlier-Aware OLS)** | **`0.17 MB`** | **`5.73x`** | **`1.6692e-3`** | **`9.6453e-3`** | **`23.27 dB`** | **`8.8033e-3` (`2.13x`)** |
+| **5. `Q4_GoldenOpt` (IEEE-754 Sign-Bit Stealing + Golden Search)** | **`0.16 MB`** | **`6.40x`** | **`1.5209e-3`** | **`1.9680e-2`** | **`24.08 dB`** | **`8.2011e-3` (`2.29x`)** |
 
 > **Algebraic Breakthrough (`Q4_Hadamard`):** By rotating each 32-weight block into the normalized Walsh-Hadamard orthonormal basis ($\mathbf{w}' = \mathbf{H}_{32}\mathbf{w}$, where $\mathbf{H}_{32}^T \mathbf{H}_{32} = \mathbf{I}$ and $\|\mathbf{H}_{32}\mathbf{w}\|_2 = \|\mathbf{w}\|_2$), coordinate outliers are dissolved uniformly across all 32 dimensions via the Fast Walsh-Hadamard Transform (`O(K log K)` additions/subtractions). This boosts 4-bit SQNR by **`+4.38 dB` (`2.74x` less noise power) with ZERO extra memory (`6.40x` compression)**, and enables direct rotated-basis GEMM: $(\mathbf{A}\mathbf{H}_{32})(\mathbf{B}\mathbf{H}_{32})^T = \mathbf{A}\mathbf{B}^T$.
 >
 > **Statistical Breakthrough (`Q4_Stats`):** Isolating $>3.2\hat{\sigma}$ outliers via Trimmed-MAD + OLS scale regression improves 4-bit SQNR by **`+6.46 dB`** (**`4.43x` less quantization noise power**) and makes downstream neural layer matrix multiplication **`2.13x` more accurate** at **`5.73x` memory compression**.
+>
+> **Optimization Breakthrough (`Q4_GoldenOpt`):** In any 20-byte block (`scale_bf16: u16`, `param_bf16: u16`, `nibbles: [u8; 16]`), both scale parameters $s > 0$ and $p > 0$ are strictly positive magnitudes, leaving their **two IEEE-754 sign bits (`0x8000`) 100% unused**. `Q4_GoldenOpt` steals these 2 bits to switch per-block between **4 adaptive codebook topologies** (a 16-level power-law manifold $w_k(\alpha) = \text{sign}(c_k)|c_k|^\alpha$ for Gaussian blocks, and decoupled dual-scale inlier/outlier manifolds for heavy-tailed blocks), solved via **derivative-free Golden Section Search** ($r = \frac{\sqrt{5}-1}{2} \approx 0.618034$) and **closed-form decoupled OLS ($\nabla J = \mathbf{0}$)**. Result: **`24.08 dB` SQNR (`+7.27 dB` over `Q4_0` and `+0.81 dB` over `Q4_Stats`) and `2.29x` lower neural layer drift at full `6.40x` compression (`0.16 MB`, zero external outlier tables)!**
 
 ---
 

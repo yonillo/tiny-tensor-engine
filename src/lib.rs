@@ -7,7 +7,8 @@ mod tests {
     use crate::matmul::{matmul_ikj_simd, matmul_naive, matmul_parallel, matmul_tiled};
     use crate::quant::{
         fwht_32_inplace, matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4,
-        QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats, QuantizedTensorQ8, TensorStats,
+        QuantizedTensorQ4Golden, QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats,
+        QuantizedTensorQ8, TensorStats,
     };
     use crate::tensor::Tensor2D;
 
@@ -97,5 +98,17 @@ mod tests {
         let c_rot_gemm = matmul_q4_hadamard(&acts, &w_sub_q4_had);
         let c_deq_gemm = matmul_ikj_simd(&acts, &w_sub_q4_had.dequantize().transpose());
         assert!(c_rot_gemm.max_abs_diff(&c_deq_gemm) < 1e-4);
+
+        // Test 5: Golden Section Search + IEEE-754 Sign-Bit Stealing (Q4_GoldenOpt)
+        // Must maintain strict 20-byte block (6.40x compression) AND beat Q4_Stats in SQNR!
+        let q4_gold = QuantizedTensorQ4Golden::quantize(&llm_weights);
+        let rep_gold = q4_gold.evaluate_error(&llm_weights);
+        assert!((rep_gold.compression_ratio - 6.40).abs() < 0.01);
+        assert!(
+            rep_gold.sqnr_db > rep_stats.sqnr_db,
+            "Expected Q4_GoldenOpt ({:.2} dB) to beat Q4_Stats ({:.2} dB)",
+            rep_gold.sqnr_db,
+            rep_stats.sqnr_db
+        );
     }
 }

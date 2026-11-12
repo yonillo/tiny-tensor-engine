@@ -1,8 +1,8 @@
 use std::time::Instant;
 use tiny_tensor_engine::matmul::{matmul_ikj_simd, matmul_naive, matmul_parallel, matmul_tiled};
 use tiny_tensor_engine::quant::{
-    matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4, QuantizedTensorQ4Hadamard,
-    QuantizedTensorQ4Stats, QuantizedTensorQ8, TensorStats,
+    matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4, QuantizedTensorQ4Golden,
+    QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats, QuantizedTensorQ8, TensorStats,
 };
 use tiny_tensor_engine::tensor::Tensor2D;
 
@@ -130,6 +130,10 @@ fn run_quantization_benchmark(n: usize) {
     let w_q4_had = QuantizedTensorQ4Hadamard::quantize(&llm_weights);
     let rep_q4_had = w_q4_had.evaluate_error(&llm_weights);
 
+    // 5. Q4_GoldenOpt (Golden Section Search Non-Linear Tail Warp in 20-byte block — 6.40x compression!)
+    let w_q4_gold = QuantizedTensorQ4Golden::quantize(&llm_weights);
+    let rep_q4_gold = w_q4_gold.evaluate_error(&llm_weights);
+
     println!(" [B] Head-to-Head Compression & Precision Comparison (FP32 = {:.2} MB):", rep_q8.original_bytes as f64 / 1048576.0);
     println!(
         "{:<36} | {:>9} | {:>11} | {:>11} | {:>11} | {:>9}",
@@ -172,6 +176,15 @@ fn run_quantization_benchmark(n: usize) {
         rep_q4_stats.max_abs_error,
         rep_q4_stats.sqnr_db
     );
+    println!(
+        "{:<36} | {:>9.2} | {:>10.2}x | {:>11.4e} | {:>11.4e} | {:>9.2}",
+        "5. Q4_GoldenOpt (Golden Search 20B)",
+        rep_q4_gold.compressed_bytes as f64 / 1048576.0,
+        rep_q4_gold.compression_ratio,
+        rep_q4_gold.rmse,
+        rep_q4_gold.max_abs_error,
+        rep_q4_gold.sqnr_db
+    );
     println!();
     println!(
         " >>> ALGEBRAIC BREAKTHROUGH (Q4_Hadamard): Rotating into the Walsh-Hadamard orthonormal basis (H^T*H = I)"
@@ -186,12 +199,23 @@ fn run_quantization_benchmark(n: usize) {
         rep_q4_stats.sqnr_db - rep_q4_std.sqnr_db,
         rep_q4_stats.compression_ratio
     );
+    println!(
+        " >>> OPTIMIZATION RECORD (Q4_GoldenOpt): IEEE-754 Sign-Bit Stealing + Golden Section Search (OH Alg. 4)"
+    );
+    println!(
+        "     achieves {:.2} dB SQNR (+{:.2} dB vs Q4_0, +{:.2} dB vs Q4_Stats) at FULL {:.2}x compression (0.16 MB)!",
+        rep_q4_gold.sqnr_db,
+        rep_q4_gold.sqnr_db - rep_q4_std.sqnr_db,
+        rep_q4_gold.sqnr_db - rep_q4_stats.sqnr_db,
+        rep_q4_gold.compression_ratio
+    );
     println!();
 
     // Compare downstream Matrix Multiplication impact: C = Activations * Weights
     let c_fp32 = matmul_ikj_simd(&activations, &llm_weights);
     let c_from_q4_std = matmul_ikj_simd(&activations, &w_q4_std.dequantize());
     let c_from_q4_stats = matmul_ikj_simd(&activations, &w_q4_stats.dequantize());
+    let c_from_q4_gold = matmul_ikj_simd(&activations, &w_q4_gold.dequantize());
     // Direct rotated-basis GEMM without dequantizing weights back to canonical basis: (A * H) * (W^T * H)^T
     let w_t_q4_had = QuantizedTensorQ4Hadamard::quantize(&llm_weights.transpose());
     let t_had_gemm = Instant::now();
@@ -201,6 +225,7 @@ fn run_quantization_benchmark(n: usize) {
     let gemm_err_std = c_fp32.max_abs_diff(&c_from_q4_std);
     let gemm_err_had = c_fp32.max_abs_diff(&c_from_q4_had);
     let gemm_err_stats = c_fp32.max_abs_diff(&c_from_q4_stats);
+    let gemm_err_gold = c_fp32.max_abs_diff(&c_from_q4_gold);
 
     let weights_t_q8 = QuantizedTensorQ8::quantize(&llm_weights.transpose());
     let act_q8 = QuantizedTensorQ8::quantize(&activations);
@@ -212,6 +237,7 @@ fn run_quantization_benchmark(n: usize) {
     println!("     • Standard Q4_0 Layer Max Drift:         {:.6e}", gemm_err_std);
     println!("     • Orthonormal Q4_Hadamard Max Drift:     {:.6e} ({:.2}x more accurate, {:.2} ms rotated GEMM)", gemm_err_had, gemm_err_std / gemm_err_had, dt_had_gemm * 1000.0);
     println!("     • Outlier-Aware Q4_Stats Max Drift:      {:.6e} ({:.2}x more accurate!)", gemm_err_stats, gemm_err_std / gemm_err_stats);
+    println!("     • Golden-Section Q4_GoldenOpt Max Drift: {:.6e} ({:.2}x more accurate at 6.40x RAM!)", gemm_err_gold, gemm_err_std / gemm_err_gold);
     println!("     • Direct INT8 Q8_0 GEMM Kernel Time:     {:.2} ms", dt_qgemm * 1000.0);
     println!("================================================================================");
 }
