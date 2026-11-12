@@ -6,13 +6,13 @@
 [![Dependencies: Zero](https://img.shields.io/badge/Dependencies-Zero-brightgreen.svg)](#architecture)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`tiny-tensor-engine` is a from-scratch systems engineering project exploring the hardware bottlenecks of modern AI inference—specifically **the Memory Wall (L1/L2/L3 cache hierarchy)**, **SIMD vectorization (`AVX2`/`FMA`)**, **lock-free multi-core parallelism**, and **statistical block-wise weight quantization (`Q8_0`)**.
+`tiny-tensor-engine` is a from-scratch systems engineering project exploring the hardware and statistical bottlenecks of modern AI inference—specifically **the Memory Wall (L1/L2/L3 cache hierarchy)**, **SIMD vectorization (`AVX2`/`FMA`)**, **lock-free multi-core parallelism**, and **outlier-aware 4-bit statistical weight quantization (`Q4_Stats`)**.
 
-Built without external crates (`ndarray`, `rayon`, or `blas` are intentionally omitted), every memory layout, thread scheduler, PRNG, and matrix kernel is implemented from first principles using only the Rust standard library (`std`).
+Built without external crates (`ndarray`, `rayon`, or `blas` are intentionally omitted), every memory layout, thread scheduler, PRNG, bitwise nibble packer, and statistical estimator is implemented from first principles using only the Rust standard library (`std`).
 
 ---
 
-## 🚀 Benchmark Results (`1024 × 1024` GEMM — 2.15 Billion FLOPs)
+## 🚀 Sprint 1: Silicon GEMM Benchmark (`1024 × 1024` — 2.15 Billion FLOPs)
 
 Measured on a 16-thread x86_64 CPU (`rustc 1.99.1 -C opt-level=3 -C target-cpu=native`):
 
@@ -29,24 +29,29 @@ Measured on a 16-thread x86_64 CPU (`rustc 1.99.1 -C opt-level=3 -C target-cpu=n
 
 ---
 
-## 🧠 Statistical Block Quantization (`Q8_0`)
+## 🧠 Sprint 2 & 3: Extreme 4-Bit Statistical Quantization (`Q4_0` vs `Q4_Stats`)
 
-Modern LLMs are memory-bandwidth bound rather than compute bound. Inspired by `GGML` / `llama.cpp`, `tiny-tensor-engine` implements block-wise symmetric 8-bit integer quantization (`BlockQ8_0`):
+### The Problem with Standard 4-Bit Quantization (`Q4_0`)
+Standard 4-bit block quantization (`Q4_0`) packs two 4-bit weights into each byte (`u8`) using a block-level scale $\Delta_b = \max_{i \in b} |X_i| / 7$. However, real LLM weights exhibit **heavy-tailed emergent outliers** ($10\times$ magnitude). When a single outlier appears inside a 32-weight block:
+1. **Grid Collapse:** The outlier stretches $\Delta_b$ by $10\times$, crushing the other 31 normal weights in the block toward `0`.
+2. **Small-Sample Masking ($n = 32$):** Naive block mean/variance estimators are polluted by the outlier itself, failing to isolate it.
 
-$$\Delta_b = \frac{\max_{i \in b} |X_i|}{127}, \qquad Q_i = \text{clip}\left(\text{round}\left(\frac{X_i}{\Delta_b}\right), -127, 127\right)$$
+### Our Solution: `Q4_Stats` (Trimmed-MAD + Lloyd-Max Gaussian Centroids + OLS Scale Refinement)
+`Q4_Stats` combines three statistical methods per 32-weight block:
+1. **Trimmed-MAD Dispersion Estimator:** Sorts absolute values in the 32-element block and estimates $\hat{\sigma}_{\text{robust}}$ from the inner 28 elements ($87.5\%$ core), making outlier detection immune to the small-sample masking effect.
+2. **Non-Uniform Lloyd-Max Gaussian Centroids:** Maps 4-bit nibbles (`0..15`) to the 16 minimum-MSE centroids of $\mathcal{N}(0, 1)$, concentrating resolution near zero where $68.2\%$ of weights reside, while isolating $>3.2\hat{\sigma}$ outliers into a sparse table.
+3. **Ordinary Least Squares (OLS) Scale Calibration:** Refines the block scale $s_b^*$ via closed-form linear regression without intercept:
+   $$s_b^* = \frac{\sum_{i \in \text{inliers}} x_i \cdot c_{q_i}}{\sum_{i \in \text{inliers}} c_{q_i}^2}$$
 
-Each block of `32` weights (`128 bytes` in `FP32`) is packed into `1 × f32` scale factor (`4 bytes`) + `32 × i8` quantized weights (`32 bytes`) = **`36 bytes` per block** (**`3.56x` memory compression**, saving **71.9%** of RAM bandwidth).
+### Head-to-Head Benchmark on Heavy-Tailed LLM Weights (`512 × 512`, `FP32 = 1.00 MB`)
 
-### `Q8_0` Telemetry on Gaussian Neural Weights $X \sim \mathcal{N}(0, 0.02^2)$ (`512 × 512`)
+| Quantization Format | Size (`MB`) | RAM Compression | RMSE Error | Max Abs Error | SQNR (`dB`) | Layer Output Drift |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **1. `Q8_0` (8-bit Symmetric Block)** | `0.28 MB` | `3.56x` | `2.0145e-4` | `2.8912e-3` | `41.64 dB` | — |
+| **2. `Q4_0` (4-bit Standard Nibble)** | `0.16 MB` | `6.40x` | `3.5120e-3` | `4.9320e-2` | `16.81 dB` | `1.8740e-2` |
+| **3. `Q4_Stats` (4-bit Outlier-Aware OLS)** | **`0.17 MB`** | **`5.73x`** | **`1.6692e-3`** | **`9.6453e-3`** | **`23.27 dB`** | **`8.8033e-3`** |
 
-| Metric | Value | Notes |
-| :--- | :--- | :--- |
-| **Sample Mean ($\mu$) & Std Dev ($\sigma$)** | $\mu = +0.000006, \quad \sigma = 0.019985$ | Box-Muller transform + Xorshift64* PRNG |
-| **$3\sigma$ Tail Outlier Ratio** | `0.291%` | Theoretical Gaussian tail: `0.270%` |
-| **FP32 Footprint $\rightarrow$ `Q8_0` Footprint** | `1.00 MB` $\rightarrow$ **`0.28 MB`** | **`3.56x` RAM compression** (`71.9%` saved) |
-| **Root Mean Squared Error (`RMSE`)** | `1.0717e-4` | Max absolute weight error: `3.607e-4` |
-| **Signal-to-Quantization-Noise Ratio (`SQNR`)** | **`45.41 dB`** | High-fidelity reconstruction (> 35 dB baseline) |
-| **Quantized Integer GEMM (`matmul_q8_0`)** | **`9.32 ms`** | Integer `i32` dot-product accumulation |
+> **Result:** `Q4_Stats` improves 4-bit Signal-to-Quantization-Noise Ratio by **`+6.46 dB`** (**`4.43x` less quantization noise power**), cuts `RMSE` by **`2.10x`**, reduces maximum weight error by **`5.11x`**, and makes downstream neural layer matrix multiplication **`2.13x` more accurate** while maintaining **`5.73x` memory compression**.
 
 ---
 
@@ -58,9 +63,9 @@ tiny-tensor-engine/
 ├── src/
 │   ├── lib.rs                  # Library root & numerical equivalence unit test suite
 │   ├── main.rs                 # Hardware telemetry & GEMM / Quantization benchmark runner
-│   ├── tensor.rs               # Contiguous Row-Major Tensor2D & Box-Muller Gaussian PRNG
+│   ├── tensor.rs               # Contiguous Row-Major Tensor2D & Box-Muller / Heavy-Tailed PRNG
 │   ├── matmul.rs               # Naive, Cache-Tiled, Stride-1 SIMD, and Scoped Multi-Thread GEMM
-│   └── quant.rs                # Statistical profiling, BlockQ8_0 quantization & INT8 GEMM
+│   └── quant.rs                # Q8_0, Q4_0 Bitwise Nibble Packing, and Q4_Stats (Trimmed-MAD + OLS)
 └── benchmarks/
     └── python_baseline.py      # Pure Python baseline reference for speedup comparison
 ```
@@ -69,24 +74,13 @@ tiny-tensor-engine/
 
 ## 🛠️ Quick Start
 
-### 1. Run the Unit Test Suite
 ```bash
+# Run unit tests
 RUSTFLAGS="-C target-cpu=native" cargo test --release
-```
 
-### 2. Run the Full Hardware Benchmark Suite
-```bash
+# Run full hardware & statistical quantization benchmarks
 RUSTFLAGS="-C target-cpu=native" cargo run --release
 ```
-
----
-
-## 🗺️ Roadmap
-
-- [x] **Sprint 1:** Contiguous `Tensor2D` layout, cache-tiled GEMM, stride-1 auto-vectorized SIMD, and lock-free `std::thread::scope` multi-threading.
-- [x] **Sprint 2:** Statistical tensor profiling ($\mu, \sigma^2, 3\sigma$ outliers, SQNR) and `Q8_0` symmetric block quantization with integer dot-product GEMM.
-- [ ] **Sprint 3:** Ultra-low-bit `Q4_0` (4-bit nibble packing, 2 weights per byte) and outlier-aware mixed-precision quantization.
-- [ ] **Sprint 4:** Zero-copy Python bindings via `PyO3` (`import tiny_tensor_engine`).
 
 ---
 

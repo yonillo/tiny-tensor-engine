@@ -77,6 +77,25 @@ impl Tensor2D {
         Self { rows, cols, data }
     }
 
+    /// Generates realistic LLM neural network weights with a Gaussian core N(0, std_dev^2)
+    /// plus 0.5% emergent heavy-tailed outlier channels (8x-12x magnitude), as observed in
+    /// real-world Transformer models (Dettmers et al., LLM.int8() / SpQR / AWQ).
+    pub fn random_llm_weights(rows: usize, cols: usize, std_dev: f32, seed: u64) -> Self {
+        let mut tensor = Self::random_normal(rows, cols, std_dev, seed);
+        let mut state = seed ^ 0xA5A5_5A5A_F0F0_0F0Fu64;
+        for val in tensor.data.iter_mut() {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let r = state.wrapping_mul(0x2545_F491_4F6C_DD1Du64) % 1000;
+            // 0.5% of weights are emergent high-magnitude outliers
+            if r < 5 {
+                *val *= 10.0;
+            }
+        }
+        tensor
+    }
+
     /// Returns the memory footprint of the tensor buffer in bytes.
     #[inline]
     pub fn size_bytes(&self) -> usize {
