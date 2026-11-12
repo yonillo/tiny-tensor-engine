@@ -2,6 +2,7 @@ pub mod aedv;
 pub mod matmul;
 pub mod quant;
 pub mod safetensors;
+pub mod silicon;
 pub mod tensor;
 
 #[cfg(test)]
@@ -12,6 +13,9 @@ mod tests {
         fwht_32_inplace, matmul_q4_golden, matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4,
         QuantizedTensorQ4Golden, QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats,
         QuantizedTensorQ8, TensorStats,
+    };
+    use crate::silicon::{
+        hamming74_decode_heal, hamming74_encode, matmul_q4_golden_silicon, matmul_q8_0_silicon,
     };
     use crate::tensor::Tensor2D;
 
@@ -131,6 +135,29 @@ mod tests {
                     lam,
                     y_rec
                 );
+            }
+        }
+
+        // Test 7: Silicon AVX2/NEON Kernels & IC1 Hamming(7,4) Hardware ECC Self-Healing
+        let c_gold_silicon = matmul_q4_golden_silicon(&acts, &w_sub_q4_gold);
+        assert!(c_gold_direct.max_abs_diff(&c_gold_silicon) < 1e-4);
+
+        let acts_q8 = QuantizedTensorQ8::quantize(&acts);
+        let w_sub_q8 = QuantizedTensorQ8::quantize(&w_sub);
+        let c_q8_scalar = matmul_q8_0(&acts_q8, &w_sub_q8);
+        let c_q8_silicon = matmul_q8_0_silicon(&acts_q8, &w_sub_q8);
+        assert!(c_q8_scalar.max_abs_diff(&c_q8_silicon) < 1e-4);
+
+        for nibble in 0..16u8 {
+            let cw = hamming74_encode(nibble);
+            let (clean, syn0) = hamming74_decode_heal(cw);
+            assert_eq!(clean, nibble);
+            assert_eq!(syn0, 0);
+            for bit_pos in 1..=7u8 {
+                let corrupted = cw ^ (1u8 << (bit_pos - 1));
+                let (healed, syn) = hamming74_decode_heal(corrupted);
+                assert_eq!(healed, nibble, "Failed to heal nibble {} at bit {}", nibble, bit_pos);
+                assert_eq!(syn, bit_pos);
             }
         }
     }

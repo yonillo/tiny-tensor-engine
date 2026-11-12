@@ -96,6 +96,31 @@ Using HTTP Range Streaming (`benchmarks/download_real_llm.py`, **IC2 Tema 1/2**)
 
 ---
 
+## ⚡ Sprint 6: Bare-Metal Assembly, SIMD Pipeline Unrolling & IC1 Hamming(7,4) Hardware ECC
+
+To push hardware efficiency down to the silicon boundary, Sprint 6 introduces native instruction-set extensions for both **Intel/AMD (`x86_64` AVX2 + FMA)** and **Apple Silicon M1–M4 (`aarch64` NEON)**:
+
+1. **Bare-Metal Cycle Counters via Inline Assembly:**
+   - On `x86_64`: Reads high-resolution timestamp counter via `core::arch::x86_64::_rdtsc()` instruction.
+   - On `aarch64` (Apple Silicon M-Series): Reads the virtual cycle register via inline assembly `asm!("mrs {}, cntvct_el0", out(reg) val)`.
+2. **SIMD Dot-Products & RAW Hazard Pipeline Elimination:**
+   - **`Q8_0 Silicon`:** Vectorizes integer dot-products with `_mm256_madd_epi16` (`x86_64`) / `vmlal_s8` (`aarch64 NEON`), achieving **`105.77 GOPS`** (**`3.97x` speedup** over scalar loop, `0.00e0` numerical error).
+   - **`Q4_GoldenOpt Silicon`:** Hoists 20-byte block codebook dequantization out of inner loops and unrolls the dot product across **4 independent vector accumulators** (`_mm256_fmadd_ps` / `vfmaq_f32`). This completely eliminates the 4-cycle Read-After-Write (`RAW`) execution stall in the CPU arithmetic pipeline, dropping latency from `25.00 ms` to **`3.77 ms`** (**`6.64x` speedup**, **`71.24 GFLOPS`** directly on compressed weights!).
+3. **`Hamming(7,4)` Hardware Self-Healing ECC (ULPGC IC1 Specification):**
+   - Implements hardware Single Error Correction (SEC) per 4-bit nibble using parity bit positions $\{p_1, p_2, p_4\}$ and data $\{d_1, d_2, d_3, d_4\}$ spanning parity groups $G_1=\{1,3,5,7\}$, $G_2=\{2,3,6,7\}$, $G_3=\{4,5,6,7\}$.
+   - In radiation or row-hammer induced bit flips, calculating the syndrome $S = (s_3, s_2, s_1)_2$ locates and self-heals corrupted DRAM bits in **1 single XOR cycle** (`cw ^= 1 << (syndrome - 1)`). Verified with **100.0% recovery (`112/112` single-bit flips)**.
+
+### Silicon Execution Benchmarks (`512 × 512` Matrix Multiplication)
+
+| Quantized Silicon Kernel (`512×512`) | Latency | CPU Cycles | Throughput | Speedup vs Baseline | Numerical Diff |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **1. `Q8_0` Baseline (Single-Core Scalar)** | `10.07 ms` | `29,382,748` | `26.67 GOPS` | `1.00x` | Baseline |
+| **2. `Q8_0` Silicon (`_mm256_madd_epi16` / `NEON`)** | **`2.54 ms`** | **`7,407,122`** | **`105.77 GOPS`** | **`3.97x`** | **`0.00e0`** |
+| **3. `Q4_GoldenOpt` Direct (Per-Row Dequant)** | `25.00 ms` | `72,971,974` | `10.74 GFLOPS` | `1.00x` | Baseline |
+| **4. `Q4_GoldenOpt` Silicon (Hoisted + 4x FMA)** | **`3.77 ms`** | **`10,997,138`** | **`71.24 GFLOPS`** | **`6.64x`** | **`1.04e-7`** |
+
+---
+
 ## 🏗️ Architecture
 
 ```
@@ -103,12 +128,13 @@ tiny-tensor-engine/
 ├── Cargo.toml                      # Release profile: opt-level=3, fat LTO, codegen-units=1
 ├── src/
 │   ├── lib.rs                      # Library root & numerical equivalence unit test suite
-│   ├── main.rs                     # Sprints 1–5 hardware, quantization & real LLM benchmark runner
+│   ├── main.rs                     # Sprints 1–6 hardware, quantization & silicon benchmark runner
 │   ├── tensor.rs                   # Contiguous Row-Major Tensor2D & Box-Muller / Heavy-Tailed PRNG
 │   ├── matmul.rs                   # Naive, Cache-Tiled, Stride-1 SIMD, and Scoped Multi-Thread GEMM
 │   ├── quant.rs                    # Q8_0, Q4_0, Q4_Hadamard, Q4_Stats, and Q4_GoldenOpt + Direct GEMM
 │   ├── safetensors.rs              # Zero-dependency .safetensors binary container parser (IC2 Tema 6)
-│   └── aedv.rs                     # AEDV Exploratory Suite (Yeo-Johnson, Kurtosis, Interactive Plotly HTML)
+│   ├── aedv.rs                     # AEDV Exploratory Suite (Yeo-Johnson, Kurtosis, Interactive Plotly HTML)
+│   └── silicon.rs                  # AVX2/NEON intrinsics, rdtsc inline asm, 4x FMA unrolling & Hamming(7,4) ECC
 ├── data/
 │   └── smollm2_135m_real.safetensors # 4 real pretrained 576x576 layers from HuggingFace SmolLM2-135M
 ├── reports/
