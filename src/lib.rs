@@ -6,7 +6,8 @@ pub mod tensor;
 mod tests {
     use crate::matmul::{matmul_ikj_simd, matmul_naive, matmul_parallel, matmul_tiled};
     use crate::quant::{
-        matmul_q8_0, QuantizedTensorQ4, QuantizedTensorQ4Stats, QuantizedTensorQ8, TensorStats,
+        fwht_32_inplace, matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4,
+        QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats, QuantizedTensorQ8, TensorStats,
     };
     use crate::tensor::Tensor2D;
 
@@ -68,5 +69,33 @@ mod tests {
         );
         assert!(rep_stats.rmse < rep_std.rmse * 0.5);
         assert!(rep_stats.compression_ratio > 5.0);
+
+        // Test 4: Algebraic Hadamard Orthogonal Change-of-Basis Quantization (Q4_Hadamard)
+        // Verify Euclidean norm preservation ||H * x||_2 == ||x||_2 and self-inverse H * (H * x) == x
+        let mut sample_block = [0.0f32; 32];
+        sample_block.copy_from_slice(&llm_weights.data[0..32]);
+        let orig_norm_sq: f32 = sample_block.iter().map(|v| v * v).sum();
+        let mut rotated_block = sample_block;
+        fwht_32_inplace(&mut rotated_block);
+        let rot_norm_sq: f32 = rotated_block.iter().map(|v| v * v).sum();
+        assert!((orig_norm_sq - rot_norm_sq).abs() < 1e-5, "Hadamard must preserve Euclidean norm");
+        fwht_32_inplace(&mut rotated_block);
+        for i in 0..32 {
+            assert!((sample_block[i] - rotated_block[i]).abs() < 1e-5, "H_32^-1 must equal H_32");
+        }
+
+        let q4_had = QuantizedTensorQ4Hadamard::quantize(&llm_weights);
+        let rep_had = q4_had.evaluate_error(&llm_weights);
+        // Q4_Hadamard achieves full 6.40x compression AND beats Q4_0 by >3.5 dB without any outlier table!
+        assert!((rep_had.compression_ratio - 6.40).abs() < 0.01);
+        assert!(rep_had.sqnr_db > rep_std.sqnr_db + 3.5);
+
+        // Verify direct rotated-basis GEMM: (A * H) * (B * H)^T == A * B^T
+        let acts = Tensor2D::random_normal(64, 256, 0.05, 999);
+        let w_sub = Tensor2D::random_llm_weights(64, 256, 0.02, 2026);
+        let w_sub_q4_had = QuantizedTensorQ4Hadamard::quantize(&w_sub);
+        let c_rot_gemm = matmul_q4_hadamard(&acts, &w_sub_q4_had);
+        let c_deq_gemm = matmul_ikj_simd(&acts, &w_sub_q4_had.dequantize().transpose());
+        assert!(c_rot_gemm.max_abs_diff(&c_deq_gemm) < 1e-4);
     }
 }
