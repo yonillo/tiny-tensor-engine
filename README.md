@@ -51,13 +51,26 @@ Standard 4-bit block quantization (`Q4_0`) packs two 4-bit weights into each byt
 | **2. `Q4_0` (4-bit Canonical Basis)** | `0.16 MB` | `6.40x` | `3.5120e-3` | `4.9320e-2` | `16.81 dB` | `1.8740e-2` (`1.00x`) |
 | **3. `Q4_Hadamard` (4-bit Orthonormal Basis $H_{32}$)** | **`0.16 MB`** | **`6.40x`** | **`2.1220e-3`** | **`3.3063e-2`** | **`21.18 dB`** | **`1.6909e-2` (`1.11x`)** |
 | **4. `Q4_Stats` (4-bit Outlier-Aware OLS)** | **`0.17 MB`** | **`5.73x`** | **`1.6692e-3`** | **`9.6453e-3`** | **`23.27 dB`** | **`8.8033e-3` (`2.13x`)** |
-| **5. `Q4_GoldenOpt` (IEEE-754 Sign-Bit Stealing + Golden Search)** | **`0.16 MB`** | **`6.40x`** | **`1.5209e-3`** | **`1.9680e-2`** | **`24.08 dB`** | **`8.2011e-3` (`2.29x`)** |
+| **5. `Q4_GoldenOpt` (Sign-Bit + 6-bit Mantissa + Golden Search)** | **`0.16 MB`** | **`6.40x`** | **`1.4554e-3`** | **`1.2857e-2`** | **`24.46 dB`** | **`8.0671e-3` (`2.32x`)** |
 
 > **Algebraic Breakthrough (`Q4_Hadamard`):** By rotating each 32-weight block into the normalized Walsh-Hadamard orthonormal basis ($\mathbf{w}' = \mathbf{H}_{32}\mathbf{w}$, where $\mathbf{H}_{32}^T \mathbf{H}_{32} = \mathbf{I}$ and $\|\mathbf{H}_{32}\mathbf{w}\|_2 = \|\mathbf{w}\|_2$), coordinate outliers are dissolved uniformly across all 32 dimensions via the Fast Walsh-Hadamard Transform (`O(K log K)` additions/subtractions). This boosts 4-bit SQNR by **`+4.38 dB` (`2.74x` less noise power) with ZERO extra memory (`6.40x` compression)**, and enables direct rotated-basis GEMM: $(\mathbf{A}\mathbf{H}_{32})(\mathbf{B}\mathbf{H}_{32})^T = \mathbf{A}\mathbf{B}^T$.
 >
 > **Statistical Breakthrough (`Q4_Stats`):** Isolating $>3.2\hat{\sigma}$ outliers via Trimmed-MAD + OLS scale regression improves 4-bit SQNR by **`+6.46 dB`** (**`4.43x` less quantization noise power**) and makes downstream neural layer matrix multiplication **`2.13x` more accurate** at **`5.73x` memory compression**.
 >
-> **Optimization Breakthrough (`Q4_GoldenOpt`):** In any 20-byte block (`scale_bf16: u16`, `param_bf16: u16`, `nibbles: [u8; 16]`), both scale parameters $s > 0$ and $p > 0$ are strictly positive magnitudes, leaving their **two IEEE-754 sign bits (`0x8000`) 100% unused**. `Q4_GoldenOpt` steals these 2 bits to switch per-block between **4 adaptive codebook topologies** (a 16-level power-law manifold $w_k(\alpha) = \text{sign}(c_k)|c_k|^\alpha$ for Gaussian blocks, and decoupled dual-scale inlier/outlier manifolds for heavy-tailed blocks), solved via **derivative-free Golden Section Search** ($r = \frac{\sqrt{5}-1}{2} \approx 0.618034$) and **closed-form decoupled OLS ($\nabla J = \mathbf{0}$)**. Result: **`24.08 dB` SQNR (`+7.27 dB` over `Q4_0` and `+0.81 dB` over `Q4_Stats`) and `2.29x` lower neural layer drift at full `6.40x` compression (`0.16 MB`, zero external outlier tables)!**
+> **Optimization Breakthrough (`Q4_GoldenOpt`):** In any 20-byte block (`scale_bf16: u16`, `param_bf16: u16`, `nibbles: [u8; 16]`), both scale parameters $s > 0$ and $p > 0$ are strictly positive magnitudes, leaving their **two IEEE-754 sign bits (`0x8000`) 100% unused**. `Q4_GoldenOpt` steals these 2 bits to switch per-block between **4 adaptive codebook topologies**, and in multi-outlier blocks (`Modes 10 & 11`) embeds a **6-bit secondary outlier ratio sub-channel ($\rho = T_2 / T_1$)** inside the 4 LSB mantissa bits of `scale_bf16` and 2 LSB mantissa bits of `param_bf16`, solved via **derivative-free Golden Section Search** ($r = \frac{\sqrt{5}-1}{2} \approx 0.618034$) and **closed-form decoupled OLS ($\nabla J = \mathbf{0}$)**. Result: **`24.46 dB` SQNR (`+7.65 dB` over `Q4_0` and `+1.19 dB` over `Q4_Stats`), `2.32x` lower neural layer drift, and `27.66 ms` direct compressed-domain GEMM at full `6.40x` compression (`0.16 MB`, zero external outlier tables)!**
+
+---
+
+## 🔬 Sprint 4: 4-Layer Deep Neural Network Cascade (`RMSNorm + SiLU` + `Top-1 Token %`)
+
+Passing 512 token activation vectors through 4 cascaded non-linear heavy-tailed layers (`4.00 MB` in `FP32`):
+
+| 4-Layer Cascaded Engine (`4.00 MB FP32`) | Total RAM | Logits SQNR | Cosine Similarity | Top-1 Token Agreement |
+| :--- | ---: | ---: | ---: | ---: |
+| **1. `Q4_0` (Standard 4-bit)** | `0.63 MB` (`6.40x`) | `10.35 dB` | `95.4469%` | `65.04%` |
+| **2. `Q4_Hadamard` (Orthonormal $\mathbf{H}_{32}$)** | `0.63 MB` (`6.40x`) | `14.63 dB` | `98.2737%` | `76.95%` |
+| **3. `Q4_Stats` (Sparse Outlier + OLS)** | `0.70 MB` (`5.73x`) | `16.82 dB` | `98.9614%` | `84.77%` |
+| **4. `Q4_GoldenOpt` (Sign-Bit + 6-bit Mantissa + Golden)** | **`0.63 MB` (`6.40x`)** | **`18.02 dB`** | **`99.2094%`** | **`85.55%`** |
 
 ---
 

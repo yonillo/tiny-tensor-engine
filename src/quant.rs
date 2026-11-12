@@ -637,21 +637,29 @@ pub fn matmul_q4_hadamard(
 //       non-differentiable quantization thresholds!
 // =========================================================================================
 
-const GAUSSIAN_LLOYD_MAX_14: [f32; 14] = [
-    -2.585, -1.866, -1.415, -1.057, -0.745, -0.459, -0.188, 0.000, 0.268, 0.558, 0.869, 1.225,
-    1.670, 2.450,
+// Inner 14 centroids of GAUSSIAN_LLOYD_MAX_16 (indices 1..15).
+// When combined with cb[14] = -T and cb[15] = +T at T = 2.733*s, Mode 00 reproduces
+// GAUSSIAN_LLOYD_MAX_16 identically, while allowing T to adapt continuously from 1.8*s
+// (0-outlier blocks) up to 15*s (1-outlier blocks)!
+const GAUSSIAN_INNER_14: [f32; 14] = [
+    -2.069, -1.618, -1.256, -0.942, -0.657, -0.388, -0.128, 0.000, 0.388, 0.657, 0.942, 1.256,
+    1.618, 2.069,
 ];
 
-const GAUSSIAN_LLOYD_MAX_10: [f32; 10] = [
-    -2.320, -1.490, -0.960, -0.530, -0.165, 0.000, 0.340, 0.735, 1.215, 2.050,
+const GAUSSIAN_INNER_12: [f32; 12] = [
+    -2.120, -1.560, -1.140, -0.785, -0.465, -0.165, 0.000, 0.310, 0.635, 1.010, 1.480, 2.120,
 ];
 
-const MODE2_TAIL_MULS: [f32; 6] = [-1.00, -0.62, -0.32, 0.32, 0.62, 1.00];
-const MODE3_TAIL_MULS: [f32; 6] = [-1.00, -0.78, -0.46, 0.46, 0.78, 1.00];
+const GAUSSIAN_INNER_10: [f32; 10] = [
+    -2.050, -1.390, -0.900, -0.495, -0.155, 0.000, 0.330, 0.715, 1.190, 2.050,
+];
 
 #[inline]
 fn f32_to_bf16_pos(val: f32) -> u16 {
-    ((val.abs().to_bits() >> 16) as u16) & 0x7FFF
+    let bits = val.abs().to_bits();
+    // IEEE-754 round-to-nearest-even before shifting >> 16 (cuts truncation bias by 2x)
+    let round_bias = 0x7FFF + ((bits >> 16) & 1);
+    ((bits.wrapping_add(round_bias) >> 16) as u16) & 0x7FFF
 }
 
 #[inline]
@@ -660,22 +668,50 @@ fn bf16_pos_to_f32(bits: u16) -> f32 {
 }
 
 #[inline]
-fn pack_header_bf16(scale: f32, param: f32, mode: u8) -> (u16, u16) {
-    let m0 = ((mode & 1) as u16) << 15;
-    let m1 = (((mode >> 1) & 1) as u16) << 15;
-    let s_bits = f32_to_bf16_pos(scale) | m0;
-    let p_bits = f32_to_bf16_pos(param) | m1;
-    (s_bits, p_bits)
+fn rho_to_idx6(rho: f32) -> u8 {
+    let clamped = rho.clamp(0.06, 1.00);
+    (((clamped - 0.06) / 0.94) * 63.0).round() as u8
 }
 
 #[inline]
-fn unpack_header_bf16(scale_bf16: u16, alpha_bf16: u16) -> (f32, f32, u8) {
+fn idx6_to_rho(idx: u8) -> f32 {
+    0.06 + (idx.min(63) as f32) * (0.94 / 63.0)
+}
+
+#[inline]
+fn pack_header_bf16(scale: f32, param: f32, mode: u8, rho: f32) -> (u16, u16) {
+    let m0 = ((mode & 1) as u16) << 15;
+    let m1 = (((mode >> 1) & 1) as u16) << 15;
+    let mut s_bits = f32_to_bf16_pos(scale);
+    let mut p_bits = f32_to_bf16_pos(param);
+
+    if mode >= 2 {
+        // Modes 10 and 11: Embed 6-bit secondary outlier ratio `rho = T2 / T1` into
+        // the 4 LSB mantissa bits of `scale_bf16` and 2 LSB mantissa bits of `alpha_bf16`!
+        let r_idx = rho_to_idx6(rho) as u16;
+        s_bits = (s_bits & 0x7FF0) | (r_idx & 0x000F);
+        p_bits = (p_bits & 0x7FFC) | ((r_idx >> 4) & 0x0003);
+    }
+
+    (s_bits | m0, p_bits | m1)
+}
+
+#[inline]
+fn unpack_header_bf16(scale_bf16: u16, alpha_bf16: u16) -> (f32, f32, u8, f32) {
     let m0 = (scale_bf16 >> 15) as u8;
     let m1 = (alpha_bf16 >> 15) as u8;
     let mode = (m1 << 1) | m0;
-    let scale = bf16_pos_to_f32(scale_bf16);
-    let param = bf16_pos_to_f32(alpha_bf16);
-    (scale, param, mode)
+    if mode < 2 {
+        let scale = bf16_pos_to_f32(scale_bf16);
+        let param = bf16_pos_to_f32(alpha_bf16);
+        (scale, param, mode, 1.0)
+    } else {
+        let r_idx = (((alpha_bf16 & 0x0003) << 4) | (scale_bf16 & 0x000F)) as u8;
+        let rho = idx6_to_rho(r_idx);
+        let scale = bf16_pos_to_f32(scale_bf16 & 0x7FF0);
+        let param = bf16_pos_to_f32(alpha_bf16 & 0x7FFC);
+        (scale, param, mode, rho)
+    }
 }
 
 /// Strictly 20-byte block (4-byte header + 16-byte nibbles = 20 bytes -> 6.40x compression).
@@ -696,42 +732,49 @@ pub struct QuantizedTensorQ4Golden {
 
 impl QuantizedTensorQ4Golden {
     #[inline]
-    fn build_codebook(mode: u8, scale: f32, param: f32) -> [f32; 16] {
+    pub fn build_codebook(mode: u8, scale: f32, param: f32, rho: f32) -> [f32; 16] {
         let mut cb = [0.0f32; 16];
         match mode {
             0 => {
-                // Mode 00: 16-level Golden Power-Law Gaussian Manifold
+                // Mode 00: 14 Inner Gaussian Lloyd-Max + 2 Exact Peak Outliers [±T1]
+                for k in 0..14 {
+                    cb[k] = scale * GAUSSIAN_INNER_14[k];
+                }
+                cb[14] = -param;
+                cb[15] = param;
+            }
+            1 => {
+                // Mode 01: 16-level Golden-Section Power-Law Manifold Q_k = s * sign(c_k) * |c_k|^alpha
                 let alpha = param.clamp(0.4, 2.5);
                 for k in 0..16 {
                     let c = GAUSSIAN_LLOYD_MAX_16[k];
                     cb[k] = scale * c.signum() * c.abs().powf(alpha);
                 }
             }
-            1 => {
-                // Mode 01: 14-level Gaussian Inliers + 2 Symmetric Exact Outliers [±1.00 T]
-                for k in 0..14 {
-                    cb[k] = scale * GAUSSIAN_LLOYD_MAX_14[k];
+            2 => {
+                // Mode 10: 12 Inner Gaussian Inliers + 2 Exact Peak Outliers [±T1, ±T2] via 6-bit Mantissa Sub-Channel!
+                for k in 0..12 {
+                    cb[k] = scale * GAUSSIAN_INNER_12[k];
                 }
+                let t2 = rho * param;
+                cb[12] = -t2;
+                cb[13] = t2;
                 cb[14] = -param;
                 cb[15] = param;
             }
-            2 => {
-                // Mode 10: 10-level Gaussian Inliers + 6 Multi-Outliers [±0.32 T, ±0.62 T, ±1.00 T]
-                for k in 0..10 {
-                    cb[k] = scale * GAUSSIAN_LLOYD_MAX_10[k];
-                }
-                for t in 0..6 {
-                    cb[10 + t] = MODE2_TAIL_MULS[t] * param;
-                }
-            }
             _ => {
-                // Mode 11: 10-level Gaussian Inliers + 6 Multi-Outliers [±0.46 T, ±0.78 T, ±1.00 T]
+                // Mode 11: 10 Inner Gaussian Inliers + 3-Outlier Cascade [±T3, ±T2, ±T1]
                 for k in 0..10 {
-                    cb[k] = scale * GAUSSIAN_LLOYD_MAX_10[k];
+                    cb[k] = scale * GAUSSIAN_INNER_10[k];
                 }
-                for t in 0..6 {
-                    cb[10 + t] = MODE3_TAIL_MULS[t] * param;
-                }
+                let t2 = rho * param;
+                let t3 = 0.52 * t2;
+                cb[10] = -t3;
+                cb[11] = t3;
+                cb[12] = -t2;
+                cb[13] = t2;
+                cb[14] = -param;
+                cb[15] = param;
             }
         }
         cb
@@ -751,9 +794,13 @@ impl QuantizedTensorQ4Golden {
         best_k
     }
 
-    /// Evaluates Mode 00 for a given shape exponent `alpha`, solving OLS scale `s*(alpha)`.
+    /// Evaluates Mode 01 (16-level Power-Law Manifold) for exponent `alpha`.
     #[inline]
-    fn eval_mode0(chunk: &[f32], base_sigma: f32, alpha: f32) -> (f32, u16, u16, [u8; Q_BLOCK_SIZE]) {
+    fn eval_power_mode(
+        chunk: &[f32],
+        base_sigma: f32,
+        alpha: f32,
+    ) -> (f32, u16, u16, [u8; Q_BLOCK_SIZE]) {
         let mut unit_w = [0.0f32; 16];
         for k in 0..16 {
             let c = GAUSSIAN_LLOYD_MAX_16[k];
@@ -786,9 +833,9 @@ impl QuantizedTensorQ4Golden {
             }
         }
 
-        let (s_bf16, p_bf16) = pack_header_bf16(scale, alpha, 0);
-        let (s_q, p_q, m_q) = unpack_header_bf16(s_bf16, p_bf16);
-        let cb = Self::build_codebook(m_q, s_q, p_q);
+        let (s_bf16, p_bf16) = pack_header_bf16(scale, alpha, 1, 1.0);
+        let (s_q, p_q, m_q, r_q) = unpack_header_bf16(s_bf16, p_bf16);
+        let cb = Self::build_codebook(m_q, s_q, p_q, r_q);
         let mut mse = 0.0f32;
         for (i, &v) in chunk.iter().enumerate() {
             let k = Self::nearest_code(v, &cb);
@@ -799,62 +846,75 @@ impl QuantizedTensorQ4Golden {
         (mse, s_bf16, p_bf16, codes)
     }
 
-    /// Evaluates Dual-Scale Outlier Modes (`mode in 1..=3`) for a given initial scale `s_init`
-    /// and updates `(s*, T*)` via decoupled First-Order OLS (`∇J = 0`).
+    /// Evaluates Mode 00, Mode 10, or Mode 11 with decoupled OLS refinement.
     #[inline]
     fn eval_split_mode(
         chunk: &[f32],
         mode: u8,
         s_init: f32,
-        t_init: f32,
+        t1_init: f32,
+        rho_init: f32,
+        lock_tail: bool,
     ) -> (f32, u16, u16, [u8; Q_BLOCK_SIZE]) {
         let mut scale = s_init.max(1e-8);
-        let mut tail = t_init.max(1e-8);
+        let mut tail = t1_init.max(1e-8);
+        let mut rho = rho_init.clamp(0.06, 1.00);
         let mut codes = [7u8; Q_BLOCK_SIZE];
-
-        let inlier_limit = if mode == 1 { 14usize } else { 10usize };
+        let inlier_limit = match mode {
+            0 => 14usize,
+            2 => 12usize,
+            _ => 10usize,
+        };
 
         for _iter in 0..3 {
-            let cb = Self::build_codebook(mode, scale, tail);
+            let cb = Self::build_codebook(mode, scale, tail, rho);
             let mut in_xy = 0.0f32;
             let mut in_xx = 0.0f32;
-            let mut out_xy = 0.0f32;
-            let mut out_xx = 0.0f32;
+            let mut t1_xy = 0.0f32;
+            let mut t1_xx = 0.0f32;
+            let mut t2_xy = 0.0f32;
+            let mut t2_xx = 0.0f32;
 
             for (i, &v) in chunk.iter().enumerate() {
                 let k = Self::nearest_code(v, &cb) as usize;
                 codes[i] = k as u8;
                 if k < inlier_limit {
-                    let c = if mode == 1 {
-                        GAUSSIAN_LLOYD_MAX_14[k]
-                    } else {
-                        GAUSSIAN_LLOYD_MAX_10[k]
+                    let c = match mode {
+                        0 => GAUSSIAN_INNER_14[k],
+                        2 => GAUSSIAN_INNER_12[k],
+                        _ => GAUSSIAN_INNER_10[k],
                     };
                     in_xy += v * c;
                     in_xx += c * c;
+                } else if k >= 14 {
+                    let m = if k == 14 { -1.0f32 } else { 1.0f32 };
+                    t1_xy += v * m;
+                    t1_xx += 1.0;
+                } else if k >= 12 {
+                    let m = if k == 12 { -1.0f32 } else { 1.0f32 };
+                    t2_xy += v * m;
+                    t2_xx += 1.0;
                 } else {
-                    let m = if mode == 1 {
-                        if k == 14 { -1.0 } else { 1.0 }
-                    } else if mode == 2 {
-                        MODE2_TAIL_MULS[k - 10]
-                    } else {
-                        MODE3_TAIL_MULS[k - 10]
-                    };
-                    out_xy += v * m;
-                    out_xx += m * m;
+                    let m = if k == 10 { -0.52f32 } else { 0.52f32 };
+                    t2_xy += v * m;
+                    t2_xx += m * m;
                 }
             }
             if in_xx > 1e-12 {
                 scale = (in_xy / in_xx).abs().max(1e-8);
             }
-            if out_xx > 1e-12 {
-                tail = (out_xy / out_xx).abs().max(1e-8);
+            if !lock_tail && t1_xx > 1e-12 {
+                tail = (t1_xy / t1_xx).abs().max(1e-8);
+            }
+            if mode >= 2 && t2_xx > 1e-12 && tail > 1e-12 {
+                let t2_opt = (t2_xy / t2_xx).abs();
+                rho = (t2_opt / tail).clamp(0.06, 1.00);
             }
         }
 
-        let (s_bf16, p_bf16) = pack_header_bf16(scale, tail, mode);
-        let (s_q, p_q, m_q) = unpack_header_bf16(s_bf16, p_bf16);
-        let cb = Self::build_codebook(m_q, s_q, p_q);
+        let (s_bf16, p_bf16) = pack_header_bf16(scale, tail, mode, rho);
+        let (s_q, p_q, m_q, r_q) = unpack_header_bf16(s_bf16, p_bf16);
+        let cb = Self::build_codebook(m_q, s_q, p_q, r_q);
         let mut mse = 0.0f32;
         for (i, &v) in chunk.iter().enumerate() {
             let k = Self::nearest_code(v, &cb);
@@ -881,37 +941,39 @@ impl QuantizedTensorQ4Golden {
             }
             sorted_abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let max_abs = sorted_abs[Q_BLOCK_SIZE - 1].max(1e-8);
+            let second_abs = sorted_abs[Q_BLOCK_SIZE - 2].max(1e-8);
+            let third_abs = sorted_abs[Q_BLOCK_SIZE - 3].max(1e-8);
+            let rho_init = (second_abs / max_abs).clamp(0.06, 1.00);
             let trimmed_mean_abs: f32 = sorted_abs[..28].iter().sum::<f32>() / 28.0;
             let base_sigma = (1.415 * trimmed_mean_abs).max(1e-8);
 
-            // 1. Evaluate Mode 00 via Golden Section Search (Algoritmo 4 de OH) over `alpha in [0.65, 1.75]`
+            // 1. Evaluate Mode 01 (16-level Golden Power-Law Manifold) via Golden Section Search (OH Alg. 4)
             let mut a = 0.65f32;
             let mut b = 1.75f32;
             let mut x1 = b - GOLDEN_R * (b - a);
             let mut x2 = a + GOLDEN_R * (b - a);
-            let (mut f1, _, _, _) = Self::eval_mode0(chunk, base_sigma, x1);
-            let (mut f2, _, _, _) = Self::eval_mode0(chunk, base_sigma, x2);
+            let (mut f1, _, _, _) = Self::eval_power_mode(chunk, base_sigma, x1);
+            let (mut f2, _, _, _) = Self::eval_power_mode(chunk, base_sigma, x2);
 
-            for _step in 0..8 {
+            for _step in 0..7 {
                 if f1 < f2 {
                     b = x2;
                     x2 = x1;
                     f2 = f1;
                     x1 = b - GOLDEN_R * (b - a);
-                    (f1, _, _, _) = Self::eval_mode0(chunk, base_sigma, x1);
+                    (f1, _, _, _) = Self::eval_power_mode(chunk, base_sigma, x1);
                 } else {
                     a = x1;
                     x1 = x2;
                     f1 = f2;
                     x2 = a + GOLDEN_R * (b - a);
-                    (f2, _, _, _) = Self::eval_mode0(chunk, base_sigma, x2);
+                    (f2, _, _, _) = Self::eval_power_mode(chunk, base_sigma, x2);
                 }
             }
             let alpha_opt = 0.5 * (a + b);
             let (mut best_mse, mut best_s, mut best_p, mut best_codes) =
-                Self::eval_mode0(chunk, base_sigma, alpha_opt);
-            // Also check exact alpha = 1.0 (pure Gaussian Lloyd-Max)
-            let (mse_1, s_1, p_1, codes_1) = Self::eval_mode0(chunk, base_sigma, 1.0);
+                Self::eval_power_mode(chunk, base_sigma, alpha_opt);
+            let (mse_1, s_1, p_1, codes_1) = Self::eval_power_mode(chunk, base_sigma, 1.0);
             if mse_1 < best_mse {
                 best_mse = mse_1;
                 best_s = s_1;
@@ -919,14 +981,16 @@ impl QuantizedTensorQ4Golden {
                 best_codes = codes_1;
             }
 
-            // 2. Evaluate Dual-Scale Outlier Topologies (Modes 01, 10, 11) with Golden Section over s_init
-            for mode in 1..=3u8 {
+            // 2. Evaluate Mode 00 (14 Inner + ±T1) for both Gaussian and 1-Outlier regimes
+            for &t_cand in &[2.733 * base_sigma, max_abs] {
                 let mut sa = 0.65 * base_sigma;
-                let mut sb = 1.55 * base_sigma;
+                let mut sb = 1.50 * base_sigma;
                 let mut sx1 = sb - GOLDEN_R * (sb - sa);
                 let mut sx2 = sa + GOLDEN_R * (sb - sa);
-                let (mut sf1, _, _, _) = Self::eval_split_mode(chunk, mode, sx1, max_abs);
-                let (mut sf2, _, _, _) = Self::eval_split_mode(chunk, mode, sx2, max_abs);
+                let (mut sf1, _, _, _) =
+                    Self::eval_split_mode(chunk, 0, sx1, t_cand, 1.0, false);
+                let (mut sf2, _, _, _) =
+                    Self::eval_split_mode(chunk, 0, sx2, t_cand, 1.0, false);
 
                 for _step in 0..6 {
                     if sf1 < sf2 {
@@ -934,22 +998,70 @@ impl QuantizedTensorQ4Golden {
                         sx2 = sx1;
                         sf2 = sf1;
                         sx1 = sb - GOLDEN_R * (sb - sa);
-                        (sf1, _, _, _) = Self::eval_split_mode(chunk, mode, sx1, max_abs);
+                        (sf1, _, _, _) =
+                            Self::eval_split_mode(chunk, 0, sx1, t_cand, 1.0, false);
                     } else {
                         sa = sx1;
                         sx1 = sx2;
                         sf1 = sf2;
                         sx2 = sa + GOLDEN_R * (sb - sa);
-                        (sf2, _, _, _) = Self::eval_split_mode(chunk, mode, sx2, max_abs);
+                        (sf2, _, _, _) =
+                            Self::eval_split_mode(chunk, 0, sx2, t_cand, 1.0, false);
                     }
                 }
                 let s_opt = 0.5 * (sa + sb);
-                let (mse_m, s_m, p_m, codes_m) = Self::eval_split_mode(chunk, mode, s_opt, max_abs);
-                if mse_m < best_mse {
-                    best_mse = mse_m;
-                    best_s = s_m;
-                    best_p = p_m;
-                    best_codes = codes_m;
+                for &lock in &[false, true] {
+                    let (mse_m, s_m, p_m, codes_m) =
+                        Self::eval_split_mode(chunk, 0, s_opt, t_cand, 1.0, lock);
+                    if mse_m < best_mse {
+                        best_mse = mse_m;
+                        best_s = s_m;
+                        best_p = p_m;
+                        best_codes = codes_m;
+                    }
+                }
+            }
+
+            // 3. Evaluate Mode 10 (2-Outlier 6-bit Mantissa Sub-Channel) & Mode 11 (3-Outlier Cascade)
+            for mode in 2..=3u8 {
+                for &r_cand in &[rho_init, (third_abs / max_abs).clamp(0.06, 1.00)] {
+                    let mut sa = 0.65 * base_sigma;
+                    let mut sb = 1.50 * base_sigma;
+                    let mut sx1 = sb - GOLDEN_R * (sb - sa);
+                    let mut sx2 = sa + GOLDEN_R * (sb - sa);
+                    let (mut sf1, _, _, _) =
+                        Self::eval_split_mode(chunk, mode, sx1, max_abs, r_cand, true);
+                    let (mut sf2, _, _, _) =
+                        Self::eval_split_mode(chunk, mode, sx2, max_abs, r_cand, true);
+
+                    for _step in 0..5 {
+                        if sf1 < sf2 {
+                            sb = sx2;
+                            sx2 = sx1;
+                            sf2 = sf1;
+                            sx1 = sb - GOLDEN_R * (sb - sa);
+                            (sf1, _, _, _) =
+                                Self::eval_split_mode(chunk, mode, sx1, max_abs, r_cand, true);
+                        } else {
+                            sa = sx1;
+                            sx1 = sx2;
+                            sf1 = sf2;
+                            sx2 = sa + GOLDEN_R * (sb - sa);
+                            (sf2, _, _, _) =
+                                Self::eval_split_mode(chunk, mode, sx2, max_abs, r_cand, true);
+                        }
+                    }
+                    let s_opt = 0.5 * (sa + sb);
+                    for &lock in &[true, false] {
+                        let (mse_m, s_m, p_m, codes_m) =
+                            Self::eval_split_mode(chunk, mode, s_opt, max_abs, r_cand, lock);
+                        if mse_m < best_mse {
+                            best_mse = mse_m;
+                            best_s = s_m;
+                            best_p = p_m;
+                            best_codes = codes_m;
+                        }
+                    }
                 }
             }
 
@@ -977,8 +1089,8 @@ impl QuantizedTensorQ4Golden {
     pub fn dequantize(&self) -> Tensor2D {
         let mut data = Vec::with_capacity(self.rows * self.cols);
         for block in &self.blocks {
-            let (scale, param, mode) = unpack_header_bf16(block.scale_bf16, block.alpha_bf16);
-            let cb = Self::build_codebook(mode, scale, param);
+            let (scale, param, mode, rho) = unpack_header_bf16(block.scale_bf16, block.alpha_bf16);
+            let cb = Self::build_codebook(mode, scale, param, rho);
             for &byte in &block.nibbles {
                 let u0 = (byte & 0x0F) as usize;
                 let u1 = ((byte >> 4) & 0x0F) as usize;
@@ -998,4 +1110,63 @@ impl QuantizedTensorQ4Golden {
         let rec = self.dequantize();
         QuantizationErrorReport::from_tensors(original, &rec, self.size_bytes())
     }
+}
+
+/// Direct Compressed-Domain GEMM on `Q4_GoldenOpt` (`C = A * B`), where `b_t_q4` stores `B^T`
+/// in 20-byte `BlockQ4Golden` blocks (`6.40x` compressed in L2 cache).
+/// Zero heap allocations of dequantized weight matrices: each 20-byte block is decoded into
+/// a 16-entry register LUT (`[f32; 16]`) on the fly inside the inner dot-product loop.
+pub fn matmul_q4_golden(a: &Tensor2D, b_t_q4: &QuantizedTensorQ4Golden) -> Tensor2D {
+    assert_eq!(a.cols, b_t_q4.cols, "Inner dimensions must match");
+    let m = a.rows;
+    let k = a.cols;
+    let n = b_t_q4.rows;
+    let blocks_per_row = k / Q_BLOCK_SIZE;
+
+    let mut c = Tensor2D::zeros(m, n);
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(4)
+        .min(m.max(1));
+    let rows_per_thread = (m + threads - 1) / threads;
+
+    std::thread::scope(|s| {
+        for (t_idx, c_chunk) in c.data.chunks_mut(rows_per_thread * n).enumerate() {
+            let row_start = t_idx * rows_per_thread;
+            let row_count = c_chunk.len() / n;
+            let a_slice = &a.data[row_start * k..(row_start + row_count) * k];
+            let b_blocks = &b_t_q4.blocks;
+
+            s.spawn(move || {
+                for i in 0..row_count {
+                    let a_row = &a_slice[i * k..(i + 1) * k];
+                    let c_row = &mut c_chunk[i * n..(i + 1) * n];
+
+                    for j in 0..n {
+                        let b_row_blocks = &b_blocks[j * blocks_per_row..(j + 1) * blocks_per_row];
+                        let mut sum = 0.0f32;
+
+                        for (b_idx, block) in b_row_blocks.iter().enumerate() {
+                            let (scale, param, mode, rho) =
+                                unpack_header_bf16(block.scale_bf16, block.alpha_bf16);
+                            let cb =
+                                QuantizedTensorQ4Golden::build_codebook(mode, scale, param, rho);
+                            let a_blk = &a_row[b_idx * Q_BLOCK_SIZE..(b_idx + 1) * Q_BLOCK_SIZE];
+
+                            for byte_idx in 0..(Q_BLOCK_SIZE / 2) {
+                                let byte = block.nibbles[byte_idx];
+                                let u0 = (byte & 0x0F) as usize;
+                                let u1 = ((byte >> 4) & 0x0F) as usize;
+                                sum += a_blk[2 * byte_idx] * cb[u0]
+                                    + a_blk[2 * byte_idx + 1] * cb[u1];
+                            }
+                        }
+                        c_row[j] = sum;
+                    }
+                }
+            });
+        }
+    });
+
+    c
 }

@@ -1,8 +1,9 @@
 use std::time::Instant;
 use tiny_tensor_engine::matmul::{matmul_ikj_simd, matmul_naive, matmul_parallel, matmul_tiled};
 use tiny_tensor_engine::quant::{
-    matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4, QuantizedTensorQ4Golden,
-    QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats, QuantizedTensorQ8, TensorStats,
+    matmul_q4_golden, matmul_q4_hadamard, matmul_q8_0, QuantizationErrorReport,
+    QuantizedTensorQ4, QuantizedTensorQ4Golden, QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats,
+    QuantizedTensorQ8, TensorStats,
 };
 use tiny_tensor_engine::tensor::Tensor2D;
 
@@ -215,7 +216,13 @@ fn run_quantization_benchmark(n: usize) {
     let c_fp32 = matmul_ikj_simd(&activations, &llm_weights);
     let c_from_q4_std = matmul_ikj_simd(&activations, &w_q4_std.dequantize());
     let c_from_q4_stats = matmul_ikj_simd(&activations, &w_q4_stats.dequantize());
-    let c_from_q4_gold = matmul_ikj_simd(&activations, &w_q4_gold.dequantize());
+
+    // Direct compressed-domain GEMM on Q4_GoldenOpt (20-byte blocks in L2 cache, zero FP32 weight allocation)
+    let w_t_q4_gold = QuantizedTensorQ4Golden::quantize(&llm_weights.transpose());
+    let t_gold_gemm = Instant::now();
+    let c_from_q4_gold = matmul_q4_golden(&activations, &w_t_q4_gold);
+    let dt_gold_gemm = t_gold_gemm.elapsed().as_secs_f64();
+
     // Direct rotated-basis GEMM without dequantizing weights back to canonical basis: (A * H) * (W^T * H)^T
     let w_t_q4_had = QuantizedTensorQ4Hadamard::quantize(&llm_weights.transpose());
     let t_had_gemm = Instant::now();
@@ -237,8 +244,133 @@ fn run_quantization_benchmark(n: usize) {
     println!("     • Standard Q4_0 Layer Max Drift:         {:.6e}", gemm_err_std);
     println!("     • Orthonormal Q4_Hadamard Max Drift:     {:.6e} ({:.2}x more accurate, {:.2} ms rotated GEMM)", gemm_err_had, gemm_err_std / gemm_err_had, dt_had_gemm * 1000.0);
     println!("     • Outlier-Aware Q4_Stats Max Drift:      {:.6e} ({:.2}x more accurate!)", gemm_err_stats, gemm_err_std / gemm_err_stats);
-    println!("     • Golden-Section Q4_GoldenOpt Max Drift: {:.6e} ({:.2}x more accurate at 6.40x RAM!)", gemm_err_gold, gemm_err_std / gemm_err_gold);
+    println!("     • Direct Q4_GoldenOpt Kernel Max Drift:  {:.6e} ({:.2}x more accurate, {:.2} ms direct GEMM!)", gemm_err_gold, gemm_err_std / gemm_err_gold, dt_gold_gemm * 1000.0);
     println!("     • Direct INT8 Q8_0 GEMM Kernel Time:     {:.2} ms", dt_qgemm * 1000.0);
+    println!("================================================================================");
+    println!();
+}
+
+/// Applies LLM RMSNorm + SiLU (`x * sigmoid(x)`) row-wise to simulate non-linear Transformer/MLP layers.
+fn rmsnorm_silu_inplace(t: &mut Tensor2D) {
+    let cols = t.cols;
+    for row in t.data.chunks_exact_mut(cols) {
+        let mean_sq: f32 = row.iter().map(|&v| v * v).sum::<f32>() / (cols as f32);
+        let inv_rms = 1.0 / (mean_sq + 1e-6).sqrt();
+        for v in row.iter_mut() {
+            let norm_x = *v * inv_rms;
+            // SiLU(x) = x / (1 + exp(-x))
+            *v = norm_x / (1.0 + (-norm_x).exp());
+        }
+    }
+}
+
+/// Computes Cosine Similarity (%) and Top-1 Token Argmax Agreement (%) between FP32 and quantized logits.
+fn evaluate_logits_fidelity(fp32_logits: &Tensor2D, q_logits: &Tensor2D) -> (f64, f64, f64) {
+    let rep = QuantizationErrorReport::from_tensors(fp32_logits, q_logits, 0);
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (&a, &b) in fp32_logits.data.iter().zip(q_logits.data.iter()) {
+        dot += (a as f64) * (b as f64);
+        norm_a += (a as f64) * (a as f64);
+        norm_b += (b as f64) * (b as f64);
+    }
+    let cos_sim = (dot / (norm_a.sqrt() * norm_b.sqrt() + 1e-12)) * 100.0;
+
+    let cols = fp32_logits.cols;
+    let mut top1_matches = 0usize;
+    for (row_a, row_b) in fp32_logits
+        .data
+        .chunks_exact(cols)
+        .zip(q_logits.data.chunks_exact(cols))
+    {
+        let argmax_a = row_a
+            .iter()
+            .enumerate()
+            .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+            .unwrap()
+            .0;
+        let argmax_b = row_b
+            .iter()
+            .enumerate()
+            .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+            .unwrap()
+            .0;
+        if argmax_a == argmax_b {
+            top1_matches += 1;
+        }
+    }
+    let top1_acc = (top1_matches as f64 / fp32_logits.rows as f64) * 100.0;
+    (rep.sqnr_db as f64, cos_sim, top1_acc)
+}
+
+fn run_deep_cascade_verification(n: usize) {
+    println!("================================================================================");
+    println!(
+        " [SPRINT 4] 4-LAYER DEEP NEURAL NETWORK CASCADE (RMSNorm + SiLU + Top-1 Token Test)"
+    );
+    println!("================================================================================");
+
+    let seeds = [2026u64, 31415, 27182, 16180];
+    let layers_fp32: Vec<Tensor2D> = seeds
+        .iter()
+        .map(|&s| Tensor2D::random_llm_weights(n, n, 0.02, s))
+        .collect();
+
+    let mut x_fp32 = Tensor2D::random_normal(n, n, 0.05, 777);
+    let mut x_q4_0 = x_fp32.clone();
+    let mut x_q4_had = x_fp32.clone();
+    let mut x_q4_stats = x_fp32.clone();
+    let mut x_q4_gold = x_fp32.clone();
+
+    for (l_idx, w) in layers_fp32.iter().enumerate() {
+        let w_q4_0 = QuantizedTensorQ4::quantize(w).dequantize();
+        let w_q4_had = QuantizedTensorQ4Hadamard::quantize(w).dequantize();
+        let w_q4_stats = QuantizedTensorQ4Stats::quantize(w, 3.2).dequantize();
+        let w_t_q4_gold = QuantizedTensorQ4Golden::quantize(&w.transpose());
+
+        x_fp32 = matmul_ikj_simd(&x_fp32, w);
+        x_q4_0 = matmul_ikj_simd(&x_q4_0, &w_q4_0);
+        x_q4_had = matmul_ikj_simd(&x_q4_had, &w_q4_had);
+        x_q4_stats = matmul_ikj_simd(&x_q4_stats, &w_q4_stats);
+        // Execute Q4_GoldenOpt directly in compressed 20-byte domain!
+        x_q4_gold = matmul_q4_golden(&x_q4_gold, &w_t_q4_gold);
+
+        if l_idx + 1 < layers_fp32.len() {
+            rmsnorm_silu_inplace(&mut x_fp32);
+            rmsnorm_silu_inplace(&mut x_q4_0);
+            rmsnorm_silu_inplace(&mut x_q4_had);
+            rmsnorm_silu_inplace(&mut x_q4_stats);
+            rmsnorm_silu_inplace(&mut x_q4_gold);
+        }
+    }
+
+    let (sqnr_0, cos_0, top1_0) = evaluate_logits_fidelity(&x_fp32, &x_q4_0);
+    let (sqnr_h, cos_h, top1_h) = evaluate_logits_fidelity(&x_fp32, &x_q4_had);
+    let (sqnr_s, cos_s, top1_s) = evaluate_logits_fidelity(&x_fp32, &x_q4_stats);
+    let (sqnr_g, cos_g, top1_g) = evaluate_logits_fidelity(&x_fp32, &x_q4_gold);
+
+    println!(
+        "{:<36} | {:>11} | {:>12} | {:>14} | {:>13}",
+        "4-Layer Cascaded Engine (4.00 MB FP32)", "Total RAM", "Logits SQNR", "Cosine Sim (%)", "Top-1 Token %"
+    );
+    println!("--------------------------------------------------------------------------------------------------");
+    println!(
+        "{:<36} | {:>9.2} MB | {:>9.2} dB | {:>13.4}% | {:>12.2}%",
+        "1. Q4_0 (Standard 4-bit)", 0.63, sqnr_0, cos_0, top1_0
+    );
+    println!(
+        "{:<36} | {:>9.2} MB | {:>9.2} dB | {:>13.4}% | {:>12.2}%",
+        "2. Q4_Hadamard (Orthonormal H_32)", 0.63, sqnr_h, cos_h, top1_h
+    );
+    println!(
+        "{:<36} | {:>9.2} MB | {:>9.2} dB | {:>13.4}% | {:>12.2}%",
+        "3. Q4_Stats (Sparse Outlier + OLS)", 0.70, sqnr_s, cos_s, top1_s
+    );
+    println!(
+        "{:<36} | {:>9.2} MB | {:>9.2} dB | {:>13.4}% | {:>12.2}%",
+        "4. Q4_GoldenOpt (Bivariate + Golden)", 0.63, sqnr_g, cos_g, top1_g
+    );
     println!("================================================================================");
 }
 
@@ -248,12 +380,13 @@ fn main() {
         .unwrap_or(4);
 
     println!("\n╔══════════════════════════════════════════════════════════════════════════════╗");
-    println!("║               TINY-TENSOR-ENGINE v0.2.0 — LOW-LEVEL AI RUNTIME              ║");
-    println!("║     Pure Rust • Bitwise Nibble Packing (Q4_0) & Outlier-Aware (Q4_Stats)    ║");
+    println!("║               TINY-TENSOR-ENGINE v0.3.0 — LOW-LEVEL AI RUNTIME              ║");
+    println!("║   Pure Rust • Hardware SIMD • Hadamard Basis • Golden-Section Quantization   ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
     println!(" Detected Hardware Concurrency: {} logical CPU cores\n", threads);
 
     run_gemm_benchmark(512, threads);
     run_gemm_benchmark(1024, threads);
     run_quantization_benchmark(512);
+    run_deep_cascade_verification(512);
 }

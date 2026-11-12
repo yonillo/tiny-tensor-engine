@@ -6,7 +6,7 @@ pub mod tensor;
 mod tests {
     use crate::matmul::{matmul_ikj_simd, matmul_naive, matmul_parallel, matmul_tiled};
     use crate::quant::{
-        fwht_32_inplace, matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4,
+        fwht_32_inplace, matmul_q4_golden, matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4,
         QuantizedTensorQ4Golden, QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats,
         QuantizedTensorQ8, TensorStats,
     };
@@ -110,5 +110,10 @@ mod tests {
             rep_gold.sqnr_db,
             rep_stats.sqnr_db
         );
+
+        let w_sub_q4_gold = QuantizedTensorQ4Golden::quantize(&w_sub);
+        let c_gold_direct = matmul_q4_golden(&acts, &w_sub_q4_gold);
+        let c_gold_deq = matmul_ikj_simd(&acts, &w_sub_q4_gold.dequantize().transpose());
+        assert!(c_gold_direct.max_abs_diff(&c_gold_deq) < 1e-4);
     }
 }
