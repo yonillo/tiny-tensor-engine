@@ -74,19 +74,48 @@ Passing 512 token activation vectors through 4 cascaded non-linear heavy-tailed 
 
 ---
 
+## 🌍 Sprint 5: Real Pretrained LLM Benchmark (`SmolLM2-135M` `.safetensors` + `AEDV` Suite)
+
+Using HTTP Range Streaming (`benchmarks/download_real_llm.py`, **IC2 Tema 1/2**) and our zero-dependency Rust `.safetensors` binary parser (`src/safetensors.rs`, **IC2 Tema 6**), we benchmarked **4 real pretrained Transformer layers (`1,327,104` parameters)** from `HuggingFaceTB/SmolLM2-135M`, coupled with **AEDV Exploratory Data Analysis** (Fisher Excess Kurtosis, IQR, Yeo-Johnson $\lambda^*$, and automatic interactive Plotly HTML dashboard generation in `reports/aedv_smollm2_dashboard.html`):
+
+| Real Tensor (`SmolLM2-135M`) | Shape | Excess Kurtosis | Outliers (`>3σ`) | Yeo-Johnson $\lambda^*$ | `Q4_0` (`6.40x`) | `Q4_Hadamard` (`6.40x`) | `Q4_Stats` (`5.73x`) | **`Q4_GoldenOpt` (`6.40x`)** |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `layers.0.self_attn.q_proj.weight` | `576×576` | `7.99` | `1.599%` | `1.024` | `18.92 dB` | `21.10 dB` | `22.89 dB` | **`23.04 dB` (`+4.12 dB`)** |
+| `layers.0.self_attn.o_proj.weight` | `576×576` | **`25.00`** | `1.131%` | `0.990` | `18.38 dB` | `21.13 dB` | `22.59 dB` | **`23.26 dB` (`+4.88 dB`)** |
+| `layers.15.self_attn.q_proj.weight` | `576×576` | `3.14` | `1.106%` | `1.000` | `19.78 dB` | `21.09 dB` | `21.84 dB` | **`23.02 dB` (`+3.24 dB`)** |
+| `layers.29.self_attn.o_proj.weight` | `576×576` | `2.58` | `0.555%` | `1.008` | `20.13 dB` | `21.06 dB` | `21.65 dB` | **`23.03 dB` (`+2.90 dB`)** |
+
+### 4-Layer Real `SmolLM2-135M` Cascade Fidelity (`576 Tokens × 576 Channels`)
+
+| Real `SmolLM2-135M` 4-Layer Cascade | Total RAM | Logits SQNR | Cosine Similarity | Top-1 Token Agreement |
+| :--- | ---: | ---: | ---: | ---: |
+| **1. `Q4_0` (Standard 4-bit)** | `0.79 MB` (`6.40x`) | `12.69 dB` | `97.2995%` | `71.01%` |
+| **2. `Q4_Hadamard` (Orthonormal $\mathbf{H}_{32}$)** | `0.79 MB` (`6.40x`) | `14.72 dB` | `98.3140%` | `76.39%` |
+| **3. `Q4_Stats` (Sparse Outlier + OLS)** | `0.89 MB` (`5.73x`) | `15.99 dB` | `98.7412%` | `78.12%` |
+| **4. `Q4_GoldenOpt` (Sign-Bit + 6-bit Mantissa + Golden)** | **`0.79 MB` (`6.40x`)** | **`16.41 dB`** | **`98.8585%`** | **`78.12%`** |
+
+---
+
 ## 🏗️ Architecture
 
 ```
 tiny-tensor-engine/
-├── Cargo.toml                  # Release profile: opt-level=3, fat LTO, codegen-units=1
+├── Cargo.toml                      # Release profile: opt-level=3, fat LTO, codegen-units=1
 ├── src/
-│   ├── lib.rs                  # Library root & numerical equivalence unit test suite
-│   ├── main.rs                 # Hardware telemetry & GEMM / Quantization benchmark runner
-│   ├── tensor.rs               # Contiguous Row-Major Tensor2D & Box-Muller / Heavy-Tailed PRNG
-│   ├── matmul.rs               # Naive, Cache-Tiled, Stride-1 SIMD, and Scoped Multi-Thread GEMM
-│   └── quant.rs                # Q8_0, Q4_0 Bitwise Nibble Packing, and Q4_Stats (Trimmed-MAD + OLS)
+│   ├── lib.rs                      # Library root & numerical equivalence unit test suite
+│   ├── main.rs                     # Sprints 1–5 hardware, quantization & real LLM benchmark runner
+│   ├── tensor.rs                   # Contiguous Row-Major Tensor2D & Box-Muller / Heavy-Tailed PRNG
+│   ├── matmul.rs                   # Naive, Cache-Tiled, Stride-1 SIMD, and Scoped Multi-Thread GEMM
+│   ├── quant.rs                    # Q8_0, Q4_0, Q4_Hadamard, Q4_Stats, and Q4_GoldenOpt + Direct GEMM
+│   ├── safetensors.rs              # Zero-dependency .safetensors binary container parser (IC2 Tema 6)
+│   └── aedv.rs                     # AEDV Exploratory Suite (Yeo-Johnson, Kurtosis, Interactive Plotly HTML)
+├── data/
+│   └── smollm2_135m_real.safetensors # 4 real pretrained 576x576 layers from HuggingFace SmolLM2-135M
+├── reports/
+│   └── aedv_smollm2_dashboard.html # Interactive AEDV Plotly telemetry dashboard
 └── benchmarks/
-    └── python_baseline.py      # Pure Python baseline reference for speedup comparison
+    ├── download_real_llm.py        # HTTP Range downloader for HuggingFace .safetensors layers
+    └── python_baseline.py          # Pure Python baseline reference for speedup comparison
 ```
 
 ---

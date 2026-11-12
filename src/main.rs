@@ -1,10 +1,15 @@
+use std::path::Path;
 use std::time::Instant;
+use tiny_tensor_engine::aedv::{
+    analyze_golden_modes, generate_aedv_dashboard, AedvTensorProfile, RealLayerBenchmarkRow,
+};
 use tiny_tensor_engine::matmul::{matmul_ikj_simd, matmul_naive, matmul_parallel, matmul_tiled};
 use tiny_tensor_engine::quant::{
     matmul_q4_golden, matmul_q4_hadamard, matmul_q8_0, QuantizationErrorReport,
     QuantizedTensorQ4, QuantizedTensorQ4Golden, QuantizedTensorQ4Hadamard, QuantizedTensorQ4Stats,
     QuantizedTensorQ8, TensorStats,
 };
+use tiny_tensor_engine::safetensors::SafeTensorsFile;
 use tiny_tensor_engine::tensor::Tensor2D;
 
 fn compute_gflops(n: usize, elapsed_secs: f64) -> f64 {
@@ -372,6 +377,163 @@ fn run_deep_cascade_verification(n: usize) {
         "4. Q4_GoldenOpt (Bivariate + Golden)", 0.63, sqnr_g, cos_g, top1_g
     );
     println!("================================================================================");
+    println!();
+}
+
+fn run_real_safetensors_aedv_benchmark() {
+    let st_path = Path::new("data/smollm2_135m_real.safetensors");
+    if !st_path.exists() {
+        return;
+    }
+
+    println!("================================================================================");
+    println!(
+        " [SPRINT 5] REAL PRETRAINED LLM BENCHMARK (`SmolLM2-135M` .safetensors + AEDV)"
+    );
+    println!("================================================================================");
+
+    let st = SafeTensorsFile::open(st_path).expect("Failed to parse real .safetensors file");
+    println!(
+        " [A] Loaded `{}` via Zero-Dependency Rust Binary Parser (IC2 Tema 6):",
+        st_path.display()
+    );
+    println!(
+        "{:<40} | {:>9} | {:>8} | {:>8} | {:>9} | {:>8}",
+        "Real Tensor Name (HuggingFace SmolLM2)", "Shape", "Std (σ)", "Kurtosis", "Outliers", "YJ λ*"
+    );
+    println!("--------------------------------------------------------------------------------------------------");
+
+    let mut real_tensors = Vec::new();
+    let mut rows = Vec::new();
+
+    for entry in &st.entries {
+        let t = st
+            .load_tensor_2d(&entry.name)
+            .expect("Failed to decode tensor");
+        let prof = AedvTensorProfile::analyze(&entry.name, &t);
+        println!(
+            "{:<40} | {:>4}x{:<4} | {:>8.4} | {:>8.2} | {:>8.3}% | {:>8.3}",
+            prof.name,
+            prof.rows,
+            prof.cols,
+            prof.std_dev,
+            prof.excess_kurtosis,
+            prof.outlier_3sigma_pct,
+            prof.yeo_johnson_lambda
+        );
+
+        let q8 = QuantizedTensorQ8::quantize(&t).evaluate_error(&t);
+        let q4_0 = QuantizedTensorQ4::quantize(&t).evaluate_error(&t);
+        let q4_had = QuantizedTensorQ4Hadamard::quantize(&t).evaluate_error(&t);
+        let q4_stats = QuantizedTensorQ4Stats::quantize(&t, 3.2).evaluate_error(&t);
+        let q_gold_tensor = QuantizedTensorQ4Golden::quantize(&t);
+        let mode_counts = analyze_golden_modes(&q_gold_tensor);
+        let q4_gold = q_gold_tensor.evaluate_error(&t);
+
+        rows.push(RealLayerBenchmarkRow {
+            profile: prof,
+            sqnr_q8: q8.sqnr_db,
+            sqnr_q4_0: q4_0.sqnr_db,
+            sqnr_q4_had: q4_had.sqnr_db,
+            sqnr_q4_stats: q4_stats.sqnr_db,
+            sqnr_q4_gold: q4_gold.sqnr_db,
+            mode_counts,
+        });
+        real_tensors.push(t);
+    }
+    println!();
+
+    println!(" [B] Quantization SQNR (dB) on REAL Pretrained `SmolLM2-135M` Layers (6.40x RAM):");
+    println!(
+        "{:<40} | {:>10} | {:>11} | {:>10} | {:>16}",
+        "Real Tensor Name", "Q4_0 (dB)", "Q4_Hadamard", "Q4_Stats", "Q4_GoldenOpt (20B)"
+    );
+    println!("--------------------------------------------------------------------------------------------------");
+    for r in &rows {
+        println!(
+            "{:<40} | {:>10.2} | {:>11.2} | {:>10.2} | {:>9.2} (+{:.2} dB)",
+            r.profile.name,
+            r.sqnr_q4_0,
+            r.sqnr_q4_had,
+            r.sqnr_q4_stats,
+            r.sqnr_q4_gold,
+            r.sqnr_q4_gold - r.sqnr_q4_0
+        );
+    }
+    println!();
+
+    // Run 4-Layer Deep Cascade through the 4 REAL SmolLM2-135M pretrained matrices!
+    let n = real_tensors[0].rows;
+    let mut x_fp32 = Tensor2D::random_normal(n, n, 0.05, 2026);
+    let mut x_q4_0 = x_fp32.clone();
+    let mut x_q4_had = x_fp32.clone();
+    let mut x_q4_stats = x_fp32.clone();
+    let mut x_q4_gold = x_fp32.clone();
+
+    for (l_idx, w) in real_tensors.iter().enumerate() {
+        let w_q4_0 = QuantizedTensorQ4::quantize(w).dequantize();
+        let w_q4_had = QuantizedTensorQ4Hadamard::quantize(w).dequantize();
+        let w_q4_stats = QuantizedTensorQ4Stats::quantize(w, 3.2).dequantize();
+        let w_t_q4_gold = QuantizedTensorQ4Golden::quantize(&w.transpose());
+
+        x_fp32 = matmul_ikj_simd(&x_fp32, w);
+        x_q4_0 = matmul_ikj_simd(&x_q4_0, &w_q4_0);
+        x_q4_had = matmul_ikj_simd(&x_q4_had, &w_q4_had);
+        x_q4_stats = matmul_ikj_simd(&x_q4_stats, &w_q4_stats);
+        x_q4_gold = matmul_q4_golden(&x_q4_gold, &w_t_q4_gold);
+
+        if l_idx + 1 < real_tensors.len() {
+            rmsnorm_silu_inplace(&mut x_fp32);
+            rmsnorm_silu_inplace(&mut x_q4_0);
+            rmsnorm_silu_inplace(&mut x_q4_had);
+            rmsnorm_silu_inplace(&mut x_q4_stats);
+            rmsnorm_silu_inplace(&mut x_q4_gold);
+        }
+    }
+
+    let (sqnr_0, cos_0, top1_0) = evaluate_logits_fidelity(&x_fp32, &x_q4_0);
+    let (sqnr_h, cos_h, top1_h) = evaluate_logits_fidelity(&x_fp32, &x_q4_had);
+    let (sqnr_s, cos_s, top1_s) = evaluate_logits_fidelity(&x_fp32, &x_q4_stats);
+    let (sqnr_g, cos_g, top1_g) = evaluate_logits_fidelity(&x_fp32, &x_q4_gold);
+
+    println!(" [C] 4-Layer REAL `SmolLM2-135M` Cascade Fidelity (576 Tokens x 576 Channels):");
+    println!(
+        "{:<36} | {:>11} | {:>12} | {:>14} | {:>13}",
+        "Real SmolLM2-135M 4-Layer Engine", "Total RAM", "Logits SQNR", "Cosine Sim (%)", "Top-1 Token %"
+    );
+    println!("--------------------------------------------------------------------------------------------------");
+    println!(
+        "{:<36} | {:>9.2} MB | {:>9.2} dB | {:>13.4}% | {:>12.2}%",
+        "1. Q4_0 (Standard 4-bit)", 0.79, sqnr_0, cos_0, top1_0
+    );
+    println!(
+        "{:<36} | {:>9.2} MB | {:>9.2} dB | {:>13.4}% | {:>12.2}%",
+        "2. Q4_Hadamard (Orthonormal H_32)", 0.79, sqnr_h, cos_h, top1_h
+    );
+    println!(
+        "{:<36} | {:>9.2} MB | {:>9.2} dB | {:>13.4}% | {:>12.2}%",
+        "3. Q4_Stats (Sparse Outlier + OLS)", 0.89, sqnr_s, cos_s, top1_s
+    );
+    println!(
+        "{:<36} | {:>9.2} MB | {:>9.2} dB | {:>13.4}% | {:>12.2}%",
+        "4. Q4_GoldenOpt (Sign-Bit + Golden)", 0.79, sqnr_g, cos_g, top1_g
+    );
+
+    let dash_path = "reports/aedv_smollm2_dashboard.html";
+    generate_aedv_dashboard(
+        dash_path,
+        &rows,
+        [sqnr_0, sqnr_h, sqnr_s, sqnr_g],
+        [cos_0, cos_h, cos_s, cos_g],
+        [top1_0, top1_h, top1_s, top1_g],
+    )
+    .expect("Failed to write AEDV HTML dashboard");
+    println!();
+    println!(
+        " >>> AEDV INTERACTIVE DASHBOARD GENERATED: {}",
+        dash_path
+    );
+    println!("================================================================================");
 }
 
 fn main() {
@@ -380,8 +542,8 @@ fn main() {
         .unwrap_or(4);
 
     println!("\n╔══════════════════════════════════════════════════════════════════════════════╗");
-    println!("║               TINY-TENSOR-ENGINE v0.3.0 — LOW-LEVEL AI RUNTIME              ║");
-    println!("║   Pure Rust • Hardware SIMD • Hadamard Basis • Golden-Section Quantization   ║");
+    println!("║               TINY-TENSOR-ENGINE v0.4.0 — LOW-LEVEL AI RUNTIME              ║");
+    println!("║   Pure Rust • Hardware SIMD • Hadamard Basis • Golden-Section • AEDV Suite   ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
     println!(" Detected Hardware Concurrency: {} logical CPU cores\n", threads);
 
@@ -389,4 +551,5 @@ fn main() {
     run_gemm_benchmark(1024, threads);
     run_quantization_benchmark(512);
     run_deep_cascade_verification(512);
+    run_real_safetensors_aedv_benchmark();
 }

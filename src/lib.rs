@@ -1,9 +1,12 @@
+pub mod aedv;
 pub mod matmul;
 pub mod quant;
+pub mod safetensors;
 pub mod tensor;
 
 #[cfg(test)]
 mod tests {
+    use crate::aedv::{yeo_johnson, yeo_johnson_inverse};
     use crate::matmul::{matmul_ikj_simd, matmul_naive, matmul_parallel, matmul_tiled};
     use crate::quant::{
         fwht_32_inplace, matmul_q4_golden, matmul_q4_hadamard, matmul_q8_0, QuantizedTensorQ4,
@@ -115,5 +118,20 @@ mod tests {
         let c_gold_direct = matmul_q4_golden(&acts, &w_sub_q4_gold);
         let c_gold_deq = matmul_ikj_simd(&acts, &w_sub_q4_gold.dequantize().transpose());
         assert!(c_gold_direct.max_abs_diff(&c_gold_deq) < 1e-4);
+
+        // Test 6: AEDV Yeo-Johnson forward and analytical inverse bijectivity
+        for &lam in &[0.0f32, 0.5, 1.0, 1.35, 2.0] {
+            for &y in &[-2.5f32, -0.4, 0.0, 0.35, 3.2] {
+                let z = yeo_johnson(y, lam);
+                let y_rec = yeo_johnson_inverse(z, lam);
+                assert!(
+                    (y - y_rec).abs() < 1e-4,
+                    "Yeo-Johnson inverse mismatch for y={}, lam={}: got {}",
+                    y,
+                    lam,
+                    y_rec
+                );
+            }
+        }
     }
 }
